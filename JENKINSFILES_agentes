@@ -1,0 +1,211 @@
+pipeline {
+  agent any
+
+  environment {
+    FLASK_APP = 'app/api.py'
+  }
+
+  stages {
+
+    stage('Checkout') {
+      agent { label 'agent-py' }
+      steps {
+        sh 'whoami; hostname; echo ${WORKSPACE}'
+        deleteDir()
+        git 'https://github.com/dobifree/helloworld.git'
+        // IMPORTANTÍSIMO: stash SOLO el código, NO el venv
+        stash name: 'src', includes: '**/*', excludes: 'venv/**,.venv/**', useDefaultExcludes: false
+      }
+    }
+
+    stage('Tests en paralelo') {
+      parallel {
+
+        stage('Unit') {
+          agent { label 'agent-py' }
+          steps {
+            sh 'whoami; hostname; echo ${WORKSPACE}'
+            deleteDir()
+            unstash 'src'
+            sh '''
+              python3 -m venv venv
+              . venv/bin/activate
+              pip install -q --upgrade pip
+              pip install -q pytest flask flake8 bandit coverage
+
+              export PYTHONPATH="${WORKSPACE}"
+              coverage run --branch --source=app -m pytest test/unit --junitxml=result-unit.xml
+            '''
+            junit 'result-unit.xml'
+            stash name: 'coverage', includes: '.coverage'
+          }
+        }
+
+        stage('Static') {
+          agent { label 'agent-py' }
+          steps {
+            sh 'whoami; hostname; echo ${WORKSPACE}'
+            deleteDir()
+            unstash 'src'
+            sh '''
+              python3 -m venv venv
+              . venv/bin/activate
+              pip install -q --upgrade pip
+              pip install -q flake8
+
+              flake8 app/ --exit-zero --format=pylint --output-file=flake8.out
+            '''
+            recordIssues tool: flake8(pattern: 'flake8.out')
+          }
+        }
+
+        stage('Security') {
+          agent { label 'agent-py' }
+          steps {
+            sh 'whoami; hostname; echo ${WORKSPACE}'
+            deleteDir()
+            unstash 'src'
+            sh '''
+              python3 -m venv venv
+              . venv/bin/activate
+              pip install -q --upgrade pip
+              pip install -q bandit
+
+              bandit --exit-zero -r app test \
+                -f custom -o bandit.out \
+                --msg-template '{relpath}:{line}: [{test_id}] {msg}'
+              head -80 bandit.out || true
+            '''
+            recordIssues tool: pyLint(name: 'Bandit', pattern: 'bandit.out')
+          }
+        }
+
+        stage('REST') {
+  agent { label 'agent-service' }
+  steps {
+    sh 'whoami; hostname; echo ${WORKSPACE}'
+    deleteDir()
+    unstash 'src'
+    script {
+      try {
+        sh '''
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          pip install -q pytest flask
+
+          export PYTHONPATH="${WORKSPACE}"
+          export FLASK_APP="${FLASK_APP}"
+
+          pkill -f "flask run" || true
+          fuser -k 5000/tcp || true
+
+          nohup python3 -m flask run --host=127.0.0.1 --port=5000 > flask-rest.log 2>&1 &
+          echo $! > flask-rest.pid
+
+          # Esperar a que el servicio responda (hasta 20s)
+          for i in $(seq 1 20); do
+            if curl -sSf http://127.0.0.1:5000/ >/dev/null; then
+              echo "Flask REST OK"
+              break
+            fi
+            sleep 1
+          done
+
+          # Si aún no responde, fallar y mostrar log
+          curl -sSf http://127.0.0.1:5000/ >/dev/null || (echo "Flask no responde"; tail -50 flask-rest.log; exit 1)
+
+          pytest test/rest --junitxml=result-rest.xml -k "not sqrt" || true
+        '''
+      } finally {
+        sh '''
+          if [ -f flask-rest.pid ]; then
+            kill "$(cat flask-rest.pid)" || true
+            rm -f flask-rest.pid
+          fi
+          pkill -f "flask run" || true
+        '''
+      }
+    }
+    junit testResults: 'result-rest.xml', allowEmptyResults: true
+  }
+}
+
+        stage('Performance') {
+          agent { label 'agent-perf' }
+          steps {
+            sh 'whoami; hostname; echo ${WORKSPACE}'
+            deleteDir()
+            unstash 'src'
+            script {
+              try {
+                sh '''
+                  python3 -m venv venv
+                  . venv/bin/activate
+                  pip install -q --upgrade pip
+                  pip install -q flask
+
+                  export PYTHONPATH="${WORKSPACE}"
+                  export FLASK_APP="${FLASK_APP}"
+
+                  pkill -f "flask run" || true
+                  fuser -k 5001/tcp || true
+
+                  nohup python3 -m flask run --host=127.0.0.1 --port=5001 > flask-perf.log 2>&1 &
+                  echo $! > flask-perf.pid
+                  sleep 3
+
+                  ps -p "$(cat flask-perf.pid)" >/dev/null || (echo "Flask PERF murio"; tail -50 flask-perf.log; exit 1)
+                  curl -s http://127.0.0.1:5001/ || (tail -50 flask-perf.log; exit 1)
+
+                  JMX="test/jmeter/flask.jmx"
+                  sed -i 's/<stringProp name="ThreadGroup.num_threads">[0-9]\\+<\\/stringProp>/<stringProp name="ThreadGroup.num_threads">5<\\/stringProp>/' "$JMX"
+                  sed -i 's/<stringProp name="LoopController.loops">[0-9]\\+<\\/stringProp>/<stringProp name="LoopController.loops">8<\\/stringProp>/' "$JMX"
+                  sed -i 's/:5000/:5001/g' "$JMX"
+
+                  /opt/jmeter/bin/jmeter -n -t "$JMX" -l jmeter-results.jtl -j jmeter.log
+                '''
+              } finally {
+                sh '''
+                  if [ -f flask-perf.pid ]; then
+                    kill "$(cat flask-perf.pid)" || true
+                    rm -f flask-perf.pid
+                  fi
+                  pkill -f "flask run" || true
+                '''
+              }
+            }
+            perfReport sourceDataFiles: 'jmeter-results.jtl'
+          }
+        }
+      }
+    }
+
+    stage('Coverage') {
+      agent { label 'agent-py' }
+      steps {
+        sh 'whoami; hostname; echo ${WORKSPACE}'
+        deleteDir()
+        unstash 'src'
+        unstash 'coverage'
+        sh '''
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          pip install -q coverage pytest flask
+
+          coverage xml -o coverage.xml
+          coverage report
+        '''
+        recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']]
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'pkill -f "flask run" || true'
+      cleanWs()
+    }
+  }
+}

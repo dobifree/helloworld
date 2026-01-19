@@ -1,0 +1,304 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Variables de entorno
+        FLASK_APP = 'app/api.py'
+        PYTHONPATH = "${WORKSPACE}"
+    }
+    
+    stages {
+        stage('Get Code') {
+            steps {
+                echo '=== STAGE 1: Get Code ==='
+                // Obtener código del repositorio
+                git 'https://github.com/dobifree/helloworld.git'
+                echo "Workspace: ${WORKSPACE}"
+                sh 'ls -la'
+            }
+        }
+        
+        stage('Setup') {
+            steps {
+                echo '=== STAGE: Setup Virtual Environment ==='
+                echo 'Creando entorno virtual e instalando dependencias...'
+                sh '''
+                    # Limpiar virtualenv anterior si existe
+                    rm -rf venv
+                    
+                    # Crear nuevo virtualenv
+                    python3 -m venv venv
+                    
+                    # Activar virtualenv e instalar dependencias
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install pytest flask flake8 bandit coverage
+                    
+                    echo "=== Paquetes instalados ==="
+                    pip list
+                '''
+            }
+        }
+        
+        stage('Unit') {
+            steps {
+                echo '=== STAGE 2: Unit Tests ==='
+                echo 'Ejecutando pruebas unitarias con pytest y coverage...'
+                // CRÍTICO: Las pruebas unitarias se ejecutan SOLO UNA VEZ aquí con coverage
+                sh '''
+                    # Activar virtualenv
+                    . venv/bin/activate
+                    
+                    export PYTHONPATH=${WORKSPACE}
+                    
+                    # Ejecutar tests unitarios CON coverage (para la etapa Coverage posterior)
+                    coverage run --branch --source=app -m pytest test/unit --junitxml=result-unit.xml
+                    
+                    echo "Tests unitarios completados"
+                    ls -l result-unit.xml
+                '''
+                
+                // Publicar resultados inmediatamente (elimina stage Results)
+                junit testResults: 'result-unit.xml', allowEmptyResults: false
+            }
+        }
+        
+        stage('Rest') {
+            steps {
+                echo '=== STAGE 3: REST/Integration Tests ==='
+                script {
+                    try {
+                        // Iniciar Flask en background
+                        echo 'Iniciando servidor Flask...'
+                        sh '''
+                            # Activar virtualenv
+                            . venv/bin/activate
+                            
+                            export PYTHONPATH=${WORKSPACE}
+                            export FLASK_APP=${FLASK_APP}
+                            nohup python3 -m flask run --host=0.0.0.0 --port=5000 > flask-rest.log 2>&1 &
+                            echo $! > flask-rest.pid
+                            sleep 5
+                        '''
+                        
+                        // Verificar que Flask está corriendo
+                        sh 'curl http://localhost:5000/ || echo "Flask iniciando..."'
+                        sh 'sleep 2'
+                        
+                        // Ejecutar tests REST (excluir test que requiere WireMock si falla)
+                        echo 'Ejecutando pruebas REST...'
+                        sh '''
+                            # Activar virtualenv
+                            . venv/bin/activate
+                            
+                            export PYTHONPATH=${WORKSPACE}
+                            # Ejecutar tests REST excluyendo sqrt que requiere WireMock
+                            pytest test/rest --junitxml=result-rest.xml -k "not sqrt" || true
+                        '''
+                        
+                    } finally {
+                        // Detener Flask (SIEMPRE se ejecuta)
+                        echo 'Deteniendo servidor Flask...'
+                        sh '''
+                            if [ -f flask-rest.pid ]; then
+                                kill $(cat flask-rest.pid) || true
+                                rm flask-rest.pid
+                            fi
+                            pkill -f "flask run" || true
+                        '''
+                    }
+                }
+                
+                // Publicar resultados REST
+                junit testResults: 'result-rest.xml', allowEmptyResults: true
+            }
+        }
+        
+        stage('Static') {
+            steps {
+                echo '=== STAGE 4: Static Code Analysis (Flake8) ==='
+                echo 'Ejecutando análisis estático con Flake8...'
+                sh '''
+                    # Activar virtualenv
+                    . venv/bin/activate
+                    
+                    # --exit-zero: No falla el build aunque haya errores
+                    # --format=pylint: Formato compatible con Warnings-ng
+                    flake8 app/ --exit-zero --format=pylint --output-file=flake8.out
+                    
+                    # Mostrar resultados
+                    echo "=== Resultados Flake8 ==="
+                    cat flake8.out || echo "No se encontraron issues"
+                '''
+                
+                // Publicar con quality gates
+                recordIssues(
+                    enabledForFailure: true,
+                    tool: flake8(pattern: 'flake8.out'),
+                    qualityGates: [
+                        [threshold: 8, type: 'TOTAL', unstable: true],
+                	    [threshold: 10, type: 'TOTAL', unstable: false]
+                    ]
+                )
+            }
+        }
+        
+        stage('Security') {
+            steps {
+                echo '=== STAGE 5: Security Analysis (Bandit) ==='
+                echo 'Ejecutando análisis de seguridad con Bandit...'
+                sh '''
+                    # Activar virtualenv
+                    . venv/bin/activate
+                    
+                    # --exit-zero: No falla el build aunque haya issues
+                    # -r: Recursivo
+                    # -f json: Formato JSON
+                    bandit --exit-zero -r app test \
+                      -f custom -o bandit.out \
+                      --msg-template "{path}:{line}: [{test_id}] {msg}"
+
+                    # Mostrar resumen
+                    echo "=== Resultados Bandit ==="
+                    head -80 bandit.out || true
+                '''
+                recordIssues(
+                    enabledForFailure: true,
+                    tool: pyLint(name: 'Bandit' ,pattern: 'bandit.out'),
+                    qualityGates: [
+                        [threshold: 2, type: 'TOTAL', unstable: true],
+                        [threshold: 4, type: 'TOTAL', unstable: false]
+                    ]
+                )
+                // Publicar con quality gates
+
+            }
+        }
+stage('Performance') {
+    steps {
+        echo '=== STAGE 6: Performance Tests (JMeter) ==='
+        script {
+            try {
+                // Iniciar Flask
+                echo 'Iniciando servidor Flask para pruebas de rendimiento...'
+                sh '''
+                    . venv/bin/activate
+
+                    export PYTHONPATH="${WORKSPACE}"
+                    export FLASK_APP="${FLASK_APP}"
+
+                    nohup python3 -m flask run --host=0.0.0.0 --port=5000 > flask-perf.log 2>&1 &
+                    echo $! > flask-perf.pid
+                    sleep 5
+                '''
+
+                // Verificar Flask
+                sh 'curl -s http://127.0.0.1:5000/ || (echo "Flask no responde" && exit 1)'
+
+                // Asegurar que el JMX cumpla: 5 hilos, 8 loops => 40 add + 40 substract
+                echo 'Ajustando JMeter test-plan a 5 hilos y 8 iteraciones (40 suma + 40 resta)...'
+                sh '''
+                    JMX="test/jmeter/flask.jmx"
+
+                    # Cambiar threads=5
+                    sed -i 's/<stringProp name="ThreadGroup.num_threads">[0-9]\\+<\\/stringProp>/<stringProp name="ThreadGroup.num_threads">5<\\/stringProp>/' "$JMX"
+
+                    # Cambiar loops=8
+                    sed -i 's/<stringProp name="LoopController.loops">[0-9]\\+<\\/stringProp>/<stringProp name="LoopController.loops">8<\\/stringProp>/' "$JMX"
+
+                    echo "=== Confirmación rápida del JMX ==="
+                    grep -n 'ThreadGroup.num_threads\\|LoopController.loops' "$JMX" | head -10
+                '''
+
+                // Ejecutar JMeter
+                echo 'Ejecutando pruebas de rendimiento con JMeter...'
+                echo 'Objetivo: 5 hilos, 40 llamadas a suma y 40 a resta (80 total)'
+                sh '''
+                    /opt/jmeter/bin/jmeter -n -t test/jmeter/flask.jmx -l jmeter-results.jtl -j jmeter.log
+
+                    echo "=== Resumen (primeras líneas) ==="
+                    head -5 jmeter-results.jtl || true
+                '''
+
+            } finally {
+                // Detener Flask
+                echo 'Deteniendo servidor Flask...'
+                sh '''
+                    if [ -f flask-perf.pid ]; then
+                        kill "$(cat flask-perf.pid)" || true
+                        rm -f flask-perf.pid
+                    fi
+                    pkill -f "flask run" || true
+                '''
+            }
+        }
+
+        // Publicar resultados de rendimiento con Performance Plugin
+        perfReport(
+            sourceDataFiles: 'jmeter-results.jtl'
+        )
+    }
+}
+        
+        stage('Coverage') {
+            steps {
+                echo '=== STAGE 7: Code Coverage Report ==='
+                echo 'Generando reporte de cobertura...'
+                // NO ejecutamos las pruebas de nuevo, usamos los datos de la etapa Unit
+                sh '''
+                    # Activar virtualenv
+                    . venv/bin/activate
+                    
+                    # Generar reporte XML para Jenkins
+                    coverage xml -o coverage.xml
+                    
+                    # Generar reporte HTML para inspección manual
+                    coverage html -d htmlcov
+                    
+                    # Mostrar reporte en consola
+                    echo "=== Reporte de Cobertura ==="
+                    coverage report
+                    
+                    # Verificar archivos generados
+                    ls -l coverage.xml htmlcov/
+                '''
+                
+                // Publicar cobertura con quality gates usando recordCoverage
+                recordCoverage(
+                    tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                    qualityGates: [
+                        // Líneas: <85% = ROJO, 85-95% = AMARILLO, >95% = VERDE
+                        [threshold: 85.0, metric: 'LINE', baseline: 'PROJECT', unstable: true],
+                        [threshold: 95.0, metric: 'LINE', baseline: 'PROJECT', unstable: false],
+                        // Ramas: <80% = ROJO, 80-90% = AMARILLO, >90% = VERDE  
+                        [threshold: 80.0, metric: 'BRANCH', baseline: 'PROJECT', unstable: true],
+                        [threshold: 90.0, metric: 'BRANCH', baseline: 'PROJECT', unstable: false]
+                    ]
+                )
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '=== POST: Limpieza ==='
+            
+            // Limpiar procesos Flask que puedan quedar
+            sh 'pkill -f "flask run" || true'
+            
+            echo '=== Pipeline completado ==='
+        }
+        
+        success {
+            echo '✓ Pipeline ejecutado exitosamente'
+        }
+        
+        unstable {
+            echo '⚠ Pipeline inestable - Revisar quality gates de Flake8, Bandit o Coverage'
+        }
+        
+        failure {
+            echo '✗ Pipeline falló - Revisar logs'
+        }
+    }
+}
